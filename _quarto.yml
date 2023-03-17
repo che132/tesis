@@ -8,8 +8,10 @@ book:
   chapters:
     - index.qmd
     - intro.qmd
-    - MAGIC.qmd
-    - CML.qmd
+    - part: MAGIC.qmd
+    - part: CML.qmd
+      chapters:
+        - "CML-2023-03-12-23_Highland_Ameca_Experimental_Design.qmd"
     - PT.qmd
     - AMF.qmd
     - summary.qmd

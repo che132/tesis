@@ -1,0 +1,342 @@
+---
+title: "2023_Highland_experiment_design"
+author: Sergio Perez-Limon
+format: html
+editor_options: 
+  chunk_output_type: console
+execute: 
+  echo: false
+---
+
+Here I use the FieldHub app to design the field evaluation of the CML F2:3 population, for the Highlands we're using a p-rep design (more info: 10.1198/108571106X154443). In total there are going to be 210 genotypes of the HI73 and HI93 populations, 320 from the HI79 and Hermes as a CHECK evaluated in two locations. For this experimental design, 70 genotypes of each biparental population are going to be replicated, and the rest (140, 140 and 250 respectively) are going as single reps. The families are selected based on the phc BLUP value. It is important to note that we're only removing a few families based on this, so there is not an important bias/selection towards the best genotypes, but it might help us to select families that are going to survive. We select the families that are going to be repeated randomly. Check is repeated 50 times. The ecperiment is designed for a 25 columns x 40 rows experiment.
+
+There is an augmented block design for Ameca, a possible "no stress" environment where we can have a baseline to compare the performance of the highland site. Here, the experiment is composed of a 53 block per repetition, and 2 replications, with the same genotypes as the p-rep design. Each genotype is present only once per replication and is not repeated across block either. 
+
+Loading libraries
+
+```{r}
+
+library(FielDHub)
+library(googlesheets4)
+library(googledrive)
+library(tidyverse)
+library(lme4)
+
+gs4_auth("checo.spl@gmail.com")
+
+```
+
+Import available genotypes and genotype information
+
+```{r}
+
+# raw data for genotypes
+data_url <- "https://docs.google.com/spreadsheets/d/14yHP2kqQZQ-wp0IdiUgeUeQIeqorQed3-m-xcwFu_Ko/edit#gid=723581705"
+
+genotypes_data_raw <- 
+  data_url %>%
+  as_id() %>%
+  range_read(sheet = "Genetic Stocks")
+
+families_url <- "https://docs.google.com/spreadsheets/d/1Mix1vFbJkeLhC3psHaOxxJscgPXsiizt-unjrE1Arbs/edit#gid=497667827"
+
+seed_availability_url <- "https://docs.google.com/spreadsheets/d/14yHP2kqQZQ-wp0IdiUgeUeQIeqorQed3-m-xcwFu_Ko/edit#gid=723581705"
+
+# Import raw data for families
+families_data_raw <- families_url %>%
+  as_id %>%
+  range_read(ss =., sheet = "UNISEM21A", skip = 1)
+
+seed_available <- seed_availability_url %>%
+  as_id() %>%
+  range_read(ss =., sheet = "Genetic Stocks")
+
+packing_seed_info_url <- "https://docs.google.com/spreadsheets/d/14yHP2kqQZQ-wp0IdiUgeUeQIeqorQed3-m-xcwFu_Ko/edit#gid=2014961217"
+
+# packing seed info
+
+packing_seed_info <- 
+  packing_seed_info_url %>%
+  as_id() %>%
+  range_read(ss =., sheet = "seed_packing_2022")
+
+packing_seed_info_unique <- 
+  packing_seed_info %>%
+  select(familia, F2_Parent, sobre_UNISEM) %>%
+  unique() %>%
+  rename(`Female genotype` = familia, `Female parent` = sobre_UNISEM)
+
+```
+
+Highland site p-rep design
+
+```{r}
+
+# Genotypes available for planting
+
+available_genos <- 
+  genotypes_data_raw %>%
+  select(family = Family_ID, pop = Population_ID, use = `Use_23 (798)`) %>%
+  filter(use == 1)
+
+# select families based on the best BLUP values
+cml_pops_raw_data <- 
+  data_url %>%
+  as_id() %>%
+  range_read("22_Highland_Raw_data_tidy") %>%
+  mutate(phc = as.double(phc)) 
+
+cml_phc_example <-
+  cml_pops_raw_data %>%
+  select(location, family, phc, nblock) %>%
+  mutate(across(c(location, family), ~ as_factor(.))) %>%
+  mutate(phc = ifelse(phc > 2 | phc == 0, NA_real_, phc)) %>%
+  filter(family != "HERMES")
+
+set.seed(100)
+phc_BLUP_example <- 
+  lmer(
+    phc ~ location + (1|family) + (1|location:nblock), data = cml_phc_example
+    ) %>%
+  ranef() %>%
+  .$family %>%
+  as_tibble(rownames = "family") %>%
+  rename(BLUP = `(Intercept)`)
+
+# Best families available based on the BLUP value
+prospect_families <- 
+  phc_BLUP_example %>%
+  semi_join(available_genos) %>%
+  mutate(pop = gsub("-\\d+$", "", family)) %>%
+  arrange(pop, desc(BLUP)) %>%
+  group_by(pop) %>%
+  mutate(id = row_number()) %>%
+  filter(
+    (pop == "HI73" & id %in% c(1:210)) | 
+      (pop == "HI93" & id %in% c(1:210)) |
+      (pop == "HI79" & id %in% c(1:320))
+  ) %>%
+  ungroup() %>%
+  rename(phc_BLUP = BLUP)
+
+# p-rep eperimental design using FieldHub
+
+highland_2023_prep_design <- 
+  partially_replicated(
+    nrows = 40, 
+    ncols = 25,
+    repGens = c(530, 210, 1),
+    repUnits = c(1, 2, 50),
+    planter = "serpentine",
+    l = 2,
+    seed = 100,
+    locationNames = c("site1", "site2")
+    )
+
+# Extracting the fieldbook from the experimental design
+high23_fieldbook <- 
+  highland_2023_prep_design$fieldBook %>%
+  as_tibble() %>%
+  rename_with(~tolower(.))
+
+# Selecting rep families by random and randomizing families within each pop
+set.seed(100)
+high_exp_data <-
+  prospect_families %>%
+  group_by(pop) %>%
+  slice_sample(prop = 1) %>%
+  mutate(id2 = row_number()) %>%
+  ungroup() %>%
+  select(family, pop, id2) %>%
+  add_row(family = "CHECK", id2 = NA, .before = 1) %>%
+  mutate(
+    rep = case_when(
+      is.na(id2) ~ 50,
+      id2 %in% c(1:70) ~ 2,
+      T ~ 1
+    )) %>%
+  arrange(desc(rep), pop, id2) %>%
+  mutate(id = row_number())
+
+treatment_family <- 
+  high23_fieldbook %>%
+  count(location, treatment) %>%
+  mutate(id = gsub("G", "", treatment) %>% as.integer()) %>%
+  rename(rep = n) %>%
+  arrange(id) %>%
+  left_join(high_exp_data) %>%
+  select(treatment, family, pop) %>%
+  distinct() %>%
+  mutate(pop = ifelse(is.na(pop), "CHECK", pop))
+
+high23_fieldbook_family <- 
+  high23_fieldbook %>%
+  left_join(treatment_family) 
+
+high23_fieldbook_family
+
+high23_fieldbook_family %>%
+  ggplot(data =., aes(x = row, y = column)) +
+  geom_tile(
+    aes(fill = pop),
+    color = "black") +
+  facet_grid(. ~ location)
+
+data_spreadsheet <-
+  high23_fieldbook_family %>%
+  select(
+    `CML23-` = plot, Description = pop, `Female genotype` = family, 
+    row_design = row, column_design = column, checks) %>%
+  mutate(
+    `Origin (Package)` = "LANGEBIO",
+    `Packed?` = " ",
+    `Who/What` = "AL/JL",
+    `Male parent` = "x sib",
+    `Male genotype` = "x sib",
+    `Number/Selection` = "14K",
+    rep = case_when(
+      checks == 0 ~ 1,
+      Description == "CHECK" ~ 50,
+      T ~ 2
+    )
+  ) %>%
+  left_join(packing_seed_info_unique) %>%
+  select(
+    `CML23-`, `Origin (Package)`:`Who/What`, Description, `Female parent`, 
+    `Male parent`, `Female genotype`,  `Male genotype`, `Number/Selection`,
+    row_design, column_design, rep
+    ) %>%
+  mutate(across(contains("Female"), ~ ifelse(is.na(.), "HERMES", .)))
+
+write_csv(data_spreadsheet, "23_highland_experiment_spreadsheet.csv")
+  
+
+```
+
+Ameca augmented complete block design 
+
+```{r}
+
+prospect_families %>%
+  count(pop) %>%
+  mutate(prop = n/sum(n)) %>%
+  mutate(a = prop*24)
+
+prospect_families %>% dim %>% .[[1]]
+
+Ameca_RCBD <- RCBD_augmented(
+  lines = prospect_families %>% dim %>% .[[1]],
+  planter = "serpentine",
+  checks = 1,
+  b = 53, 
+  repsExpt = 2, 
+  l = 1,
+  random = TRUE,
+  locationNames = c("Ameca"),
+  seed = 100, 
+  )
+
+# 57, 53, 50, 47, 44
+
+Ameca_fieldbook <- Ameca_RCBD$fieldBook %>%
+  as_tibble() %>%
+  rename_with( ~ tolower(.))
+
+Ameca_fieldbook %>%
+  filter(treatment != "CH1") %>%
+  count(block) %>%
+  mutate(nn = n/2) %>%
+  count(nn)
+
+prospect_families %>%
+  count(pop) %>% 
+  mutate(prop = n/sum(n)) %>%
+  mutate(a = prop*14)
+
+# Per block: 4 HI73/HI93; 6 HI79
+
+set.seed(100)
+Ameca_fieldbook_pops <- 
+  Ameca_fieldbook %>%
+  mutate(rep = ifelse(id < 796, 1, 2)) %>%
+  group_by(rep, block) %>%
+  mutate(rowid = row_number()) %>%
+  slice_sample(prop = 1) %>%
+  mutate(
+    type = ifelse(treatment == "CH1", "check", "family"),
+    type = factor(type, levels = c("check", "family"))
+    ) %>%
+  ungroup() %>%
+  arrange(rep, block, type) %>%
+  mutate(what = rep(c("HERMES", rep("HI73", 4), rep("HI79", 6), rep("HI93", 4)), 106)) %>%
+  filter(treatment != "Filler")
+
+Ameca_fieldbook_pops %>%
+  count(rep, what)
+
+# Need 420 HI73/HI93; 640 HI79
+
+set.seed(100)
+extra_family_replacement <- 
+  Ameca_fieldbook_pops %>%
+  filter(what %in% c("HI93", "HI73")) %>%
+  group_by(rep, what) %>%
+  slice_sample(n = 3) %>%
+  filter(
+    (rep == 1 & what == "HI73" & row_number() == 1) |
+      (rep == 1 & what == "HI93" & row_number() %in% c(1:2)) |
+      (rep == 2 & what == "HI73" & row_number() %in% c(1)) |
+      (rep == 2 & what == "HI93" & row_number() %in% c(1))
+  ) %>%
+  mutate(what = "HI79")
+
+
+set.seed(100)
+Ameca_fieldbook_pops_family <- Ameca_fieldbook_pops %>%
+  anti_join(extra_family_replacement, by = c("rep", "plot")) %>%
+  bind_rows(extra_family_replacement) %>%
+  arrange(rep, what) %>%
+  group_by(rep, what) %>%
+  slice_sample(prop = 1) %>%
+  mutate(id2 = row_number()) %>%
+  left_join(prospect_families %>% select(-phc_BLUP), by = c("what" = "pop", "id2" = "id")) %>%
+  mutate(family = ifelse(what == "HERMES", "HERMES", family)) %>%
+  ungroup()
+
+Ameca_fieldbook_pops_family %>%
+  arrange(id) %>%
+  select(id, plot:block, rep, treatment, pop = what, family)
+
+Ameca_fieldbook_pops_family %>%
+  select(id, plot:block, rep, treatment, pop = what, family) %>%
+  ggplot(data =., aes(x = column, y = row, fill = pop)) +
+  geom_tile(color = "black")
+
+Ameca_data_spreadsheet <-
+  Ameca_fieldbook_pops_family %>%
+  arrange(id) %>%
+  mutate(`CML23-` = id + 4000) %>%
+  select(
+    `CML23-`, Description = what, `Female genotype` = family, 
+    row_design = row, column_design = column, checks, rep, block) %>%
+  mutate(
+    `Origin (Package)` = "LANGEBIO",
+    `Packed?` = " ",
+    `Who/What` = "AL/JL",
+    `Male parent` = "x sib",
+    `Male genotype` = "x sib",
+    `Number/Selection` = "14K"
+    ) %>%
+  left_join(packing_seed_info_unique) %>%
+  select(
+    `CML23-`, `Origin (Package)`:`Who/What`, Description, `Female parent`, 
+    `Male parent`, `Female genotype`,  `Male genotype`, `Number/Selection`,
+    row_design, column_design, rep, block
+    ) %>%
+  mutate(across(contains("Female"), ~ ifelse(is.na(.), "HERMES", .)))
+
+write_csv(Ameca_data_spreadsheet, "Ameca_data_spreadsheet.csv")
+
+
+
+```
