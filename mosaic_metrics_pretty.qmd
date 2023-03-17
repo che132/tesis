@@ -1,0 +1,838 @@
+---
+title: "Estimate mosaic metrics MAGIC"
+format: html
+execute: 
+  freeze: true
+editor_options: 
+  chunk_output_type: console
+---
+
+There are a few questions that we can make out of the MAGIC population:
+
+-   Is there any residual populations structure in the MAGIC population?
+-   Can we improve the parenta haplotype call in the MAGIC population if we increae the number of markers?
+    -   How does the choromosomic mosaic looks in the MAGIC population?
+    -   What's the median and maximum chromosomic chunk size in the MAGIC population?
+    -   What's the median and maximum "same genotype" chunk in a pairwise comparison of the MAGIC parents?
+    -   What is the minimal number of markers that we need to obtain information similar to the total of 8.2 M markers?
+
+Logic: We hypothesize that most of the NAs or mistakes in the call of the parent in the MAGIC populations are because {qtl2} can't tell apart one parent from the other with enough confidence (with $\alpha = 0.5$) because the marker density is not enough to tell a parent from the other. In this case, increasing the number of markers between each chunk will help us only if the maximun size of the chunks with "same genotype" in the parents information is smaller than the recombination chunk size in the MAGIC population. IN other words, we're adding more relevant information in each of these chunks that would allow us to differentiate one parent from the other.
+
+Loading libraries
+
+```{r}
+
+library(tidyverse)
+library(furrr)
+plan(multisession)
+library(arrow)
+library(tidymodels)
+library(qtl2)
+library(tidymodels)
+library(finetune)
+library(reshape2)
+library(tidymodels)
+
+```
+
+Clean CrossObject: Remove weid markers and individuals based on their total number of recombinations and LODerror
+
+```{r}
+MEMA_DATA <- 
+  read_cross2(
+    "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/genetic_mapping/MEMA_CTRL_wo_weird.yaml"
+    )
+
+snp.info.founders <- readr::read_csv(
+  "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/genetic_mapping/snp.info.founders.csv"
+  ) %>%
+  filter(!is.na(snp))
+
+######################################################################################
+# Identify and remove weird markers and individuals based on error LOD and number of #   
+# recombinations                                                                     #
+######################################################################################
+
+genmap_MEMA <- MEMA_DATA$gmap
+
+# Estimate genotype probabilities
+set.seed(100)
+genoprob_MEMA <-
+  calc_genoprob(
+    cross = MEMA_DATA, 
+    map = genmap_MEMA, 
+    error_prob=0.002) %>%
+  clean_genoprob ()
+
+# Estimate the genotypes with maximum marginal probabilities
+set.seed(100)
+geno_maxprob_MEMA <- 
+  maxmarg(
+    probs = genoprob_MEMA,
+    minprob = 0.95
+    ) #assigns founder code to each marker/pos
+
+# Estimate the genotypes with maximum marginal probabilities with letters
+set.seed(100)
+geno_maxprob_letters_MEMA <- maxmarg(
+  probs= genoprob_MEMA,
+  minprob = 0.95,
+  return_char = TRUE
+  )
+```
+
+Estimate the error lod probability for any marker for any family. Positive LOD scores suggest that there might be a mistake in the genotype probability. I'm estimating the proportion of genotype calls in each marker whose errorLOD \> 0 and estimate the top 5 percentile values of the proportion distribution and remove the markers whose proportion belong to this group.
+
+```{r}
+# Calculate genotyping error LOD scores
+set.seed(100)
+errorlod_MEMA <- 
+  calc_errorlod(
+    cross = MEMA_DATA, 
+    probs = genoprob_MEMA
+    )
+
+errorlod_MEMA <- do.call("cbind", errorlod_MEMA)
+
+# matrix to df
+errorlod_MEMA_df <- 
+  errorlod_MEMA %>%
+  as_tibble(rownames = "family")
+
+# Estimate the proportion of LODerror > 0 in every marker
+errorlod_MEMA_prop_marker <- 
+  errorlod_MEMA_df %>%
+  pivot_longer(-family) %>%
+  filter(!is.infinite(value)) %>%
+  group_by(name) %>%
+  summarise(prop = sum(value >= 0)/dim(errorlod_MEMA_df)[1])
+
+errorlod_MEMA_prop_marker
+
+# Estimate the 95 percentile of the LODerror proportion distribution 
+errorlod_95_perc <- quantile(errorlod_MEMA_prop_marker$prop, 0.95)
+
+errorlod_95_perc
+
+# Remove all the markers with prop >=0.2
+
+errorlod_MEMA_prop_marker %>%
+  ggplot(data =., aes(x = prop)) +
+  geom_density(linewidth = 1) +
+  xlab("Proportion of LODerror > 0 per marker")  +
+  geom_vline(
+    aes(xintercept = errorlod_95_perc), 
+    color = "red", 
+    linetype = "dashed", 
+    linewidth = 1
+    ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    legend.position = "top"          
+    )
+
+# Select markers in the 95 percentile to remove
+errorlod_marker_remove <- errorlod_MEMA_prop_marker %>%
+  filter(prop >= errorlod_95_perc) %>%
+  .$name
+
+#############################################
+# Count number of recombinations per family #
+#############################################
+
+# Estimate the total number of recombinations per family
+set.seed(100)
+n_recomb_family_MEMA <- 
+  count_xo(geno = geno_maxprob_MEMA) %>%
+  as_tibble(rownames = "family") %>%
+  pivot_longer(-family) %>%
+  group_by(family) %>%
+  summarise(n_recomb = sum(value)) %>%
+  arrange(desc(n_recomb)) 
+
+# Identify outliers in the distribution of genomewide recombination events
+n_recomb_family_MEMA %>%
+  ggplot(data =., aes(y = n_recomb)) +
+  geom_boxplot() +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5)
+    ) +
+  ggtitle("Distribution of number of genome-wide number of recombinations per family")
+
+# Outliers total number of recomb
+outliers_lots_recomb_MEMA <- 
+  boxplot(n_recomb_family_MEMA$n_recomb, plot = F)$out
+
+# non outlier families
+family_normal_recomb <- 
+  n_recomb_family_MEMA %>%
+  filter(! n_recomb %in% outliers_lots_recomb_MEMA) %>%
+  .$family 
+
+MEMA_DATA_wo_weird <- 
+  MEMA_DATA %>%
+  drop_markers(errorlod_marker_remove) %>%
+  subset(x =., ind = family_normal_recomb)
+
+```
+
+Is there any population structure in the MEMA population?
+
+Approach: I'm going to estimate the kinship matrix using the overall option and a decomposition of eigenvalues of the same matrix and detect population structure.
+
+```{r}
+
+# Estimate genotype probabilities
+set.seed(100)
+genoprob_wo_weird_MEMA <-
+  calc_genoprob(
+    cross = MEMA_DATA_wo_weird, 
+    map = genmap_MEMA, 
+    error_prob=0.002) %>%
+  clean_genoprob ()
+
+# Estimate Allele probabilities
+set.seed(100)
+allele_prob_MEMA <- 
+  genoprob_to_alleleprob(genoprob_wo_weird_MEMA)
+
+# Estimate kinship matrix 
+set.seed(100)
+kinship_wo_weird_MEMA <- calc_kinship(
+  probs = allele_prob_MEMA,
+  type = "overall"
+  )
+
+# Estimate the eigenvalue decomposition of the kinship matrix
+set.seed(100)
+eigen_kinship_MEMA <- 
+  decomp_kinship(kinship_wo_weird_MEMA)
+
+# correlation matrix of the kinship matrix
+set.seed(100)
+corr_kindhip_MEMA <- 
+  scale_kinship (kinship_wo_weird_MEMA)
+
+# Pairwise correlation of families
+pairwise_geno_corr_MEMA <- corr_kindhip_MEMA %>%
+  as_tibble(rownames = "family") %>%
+  pivot_longer(-family) %>%
+  filter(family != name) %>%
+  mutate(code = map2_chr(
+    .x = family,
+    .y = name,
+    .f = ~ paste0(.x, .y) %>% str_split("") %>% unlist() %>% sort() %>% paste(collapse = "")
+    )) %>%
+  group_by(code) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(-code) 
+
+# Estimate 99 percentile of pairwise correlation
+geno_corr_99_perc <- quantile(pairwise_geno_corr_MEMA$value, 0.99)
+
+geno_corr_99_perc
+
+# plot the distribution of the pairwise correlation between families 
+pairwise_geno_corr_MEMA %>%
+  ggplot(data =., aes(x = value)) +
+  geom_density(linewidth = 1) +
+  xlab("Pairwise kinship between families (vertical line = 99 percentile)")  +
+  geom_vline(
+    aes(xintercept = geno_corr_99_perc), 
+    color = "red", 
+    linetype = "dashed", 
+    linewidth = 1
+    ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    legend.position = "top"          
+    )
+
+# Identify family pairwise correlation values in the 99 percentile
+familyes_high_corr <- 
+  pairwise_geno_corr_MEMA %>%
+  filter(value >= geno_corr_99_perc) %>%
+  arrange(desc(value))
+
+familyes_high_corr
+
+# Select families to drop that are in the 99th percentile but doesn't have a phenotype in the TC experiment
+
+genotyped_fam_MEMA <- 
+  MEMA_DATA_wo_weird$geno$`1` %>% rownames()
+
+families_no_pheno <- 
+  MEMA_DATA_wo_weird$pheno %>%
+  rownames() %>%
+  setdiff(genotyped_fam_MEMA, .)
+
+families_no_pheno_high_corr <- 
+  familyes_high_corr %>%
+  rowid_to_column() %>%
+  rename(cor = value) %>%
+  pivot_longer(c(family, name)) %>%
+  count(value) %>%
+  arrange(desc(n)) %>%
+  filter(value %in% families_no_pheno) %>%
+  .$value
+
+# Drop families with high correlation and not phenotyped: c("MEMA163", "MEMA210", "MEMA252")
+
+MEMA_DATA_wo_weird2 <- MEMA_DATA_wo_weird %>%
+  subset(ind = setdiff(genotyped_fam_MEMA, families_no_pheno_high_corr))
+
+```
+
+In the absence of population structure we can expect a correlation between families of 1/8. Any significant deviation from this number would imply that there is residual population structure in the population. The distribution of the pairwise correlation values for the MEMA family is right skewed with a median value of ~ 0.14, close to 0.125 (1/8) expected. This value is inflated a little bit by weird families that have a lot of correlation. We hypothesize that the high correlation values for these families (for instance families MEMA210-MEMA211; cor = 0.736)  was the result of either mistakes in the development of families: Someone mistakenly grabbed seed from an incorrect envelope that was planted and generated a very closely relted family, or it could also be the result of mistakes in collecting tissue from plants for genotyping. Nevertheless, the results show that the median pairwise correlation doesn't deviate that much from the expected under the hypothesis of no population structure, so we can conclude that there is a reduced population structure in the MEMA pop. We're going to remove highly correlated individuals for whom we don't have phenotypic data.
+
+# What is the size of the recombination chunks in the MEMA population?
+
+```{r}
+
+# Estimate genotype probabilities
+set.seed(100)
+genoprob_wo_weird2_MEMA <-
+  calc_genoprob(
+    cross = MEMA_DATA_wo_weird2, 
+    map = genmap_MEMA, 
+    error_prob=0.002) %>%
+  clean_genoprob ()
+
+# Estimate Allele probabilities
+set.seed(100)
+geno__wo_weird2_MEMA <- 
+  maxmarg(
+    probs = genoprob_wo_weird2_MEMA,
+    minprob = 0.95
+    )
+
+# Guess the phase of each family in each chromosome
+phase_MEMA <- guess_phase(MEMA_DATA_wo_weird2, geno__wo_weird2_MEMA)
+
+# genetic map
+genmap_MEMA <- 
+  MEMA_DATA_wo_weird2$gmap %>%
+  map_df(.x = ., .f = ~ .x %>% enframe(name = "marker", value = "g_pos"))
+
+# markers at the end of each chromosome
+genmap_chr_end <- 
+  genmap_MEMA %>%
+  separate(marker, into = c("chr", "p_pos"), sep = "_", remove = F) %>%
+  mutate(
+    chr = as.integer(chr),
+    p_pos = as.integer(p_pos)
+    ) %>%
+  arrange(chr, p_pos) %>%
+  group_by(chr) %>%
+  filter(row_number() == max(row_number())) %>%
+  mutate(p_pos = p_pos/1e6) %>%
+  ungroup() %>%
+  rename(chr_end = p_pos)
+  
+
+# Identify the recombination breakpoints in the MEMA population
+set.seed(100)
+recomb_location_MEMA <- 
+  locate_xo(phase_MEMA, map = MEMA_DATA_wo_weird2$gmap) %>%
+  map_df(
+    .x = .,
+    .f = ~ map_df(
+      .x = .,
+      .f = ~ enframe(.x, name = NULL, value = "location"),
+      .id = "family"
+      ),
+    .id = "chr"
+  ) %>%
+  mutate(marker = find_marker(MEMA_DATA$gmap, chr = chr, pos = location)) %>%
+  mutate(chr = as.integer(chr))
+
+# Estimate the size of the recombination chunks in the MEMA population
+recomb_chunk_size_MEMA <- 
+  recomb_location_MEMA  %>%
+  group_by(family, chr) %>%
+  nest() %>%
+  mutate(data = map(
+    .x = data, 
+    .f = ~ .x %>% add_row(location = NA, marker = NA)
+    )) %>%
+  ungroup() %>%
+  unnest(c(data), keep_empty = T) %>%
+  group_by(family, chr) %>%
+  mutate(
+    pos = gsub("^\\d{1,2}_", "", marker) %>% as.integer() %>% "/"(1e6),
+    chr = as.integer(chr)
+    ) %>%
+  mutate(
+    start = lag(pos, default = 0),
+    end = pos
+    ) %>%
+  left_join(genmap_chr_end %>% select(-marker), by = "chr") %>%
+  mutate(end = ifelse(is.na(pos), chr_end, end))  %>%
+  select(family, chr, location, marker, start, end) %>%
+  ungroup() %>%
+  mutate(chunk_size = end - start)  %>%
+  mutate(
+    p_pos_start = find_marker(MEMA_DATA$gmap, chr = chr, pos = start),
+    p_pos_end = find_marker(MEMA_DATA$gmap, chr = chr, pos = end)) %>%
+  mutate(
+    across(contains("p_pos"), ~ gsub("\\d{1,2}_", "", .) %>% as.integer() %>% "/"(1e6))
+  ) %>%
+  mutate(p_chunk_size = p_pos_end - p_pos_start) %>%
+  filter(chunk_size > 0 & p_chunk_size > 0)
+
+recomb_chunk_size_MEMA
+
+recomb_med_max_size <- 
+  recomb_chunk_size_MEMA %>%
+  summarise(
+    min_chunk_size = min(chunk_size),
+    median_chunk_size = median(chunk_size),
+    max_chunk_size = max(chunk_size)
+    )
+
+recomb_med_max_size
+
+
+recomb_chunk_size_MEMA %>%
+  ggplot(data =., aes(x = chunk_size)) +
+  geom_density(linewidth = 1) +
+  xlab("Recombination chunk size (cM)")  +
+  geom_vline(
+    data = recomb_med_max_size, 
+    aes(xintercept = median_chunk_size),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+    ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    legend.position = "top"          
+    ) +
+  ggtitle("Distribution of the recombination chunk sizes in the MEMA population")
+
+recomb_med_max_p_size <- 
+  recomb_chunk_size_MEMA %>%
+  summarise(
+    min_chunk_size_p = min(p_chunk_size),
+    median_chunk_size_p = median(p_chunk_size),
+    max_chunk_size_p = max(p_chunk_size)
+    )
+
+recomb_med_max_p_size
+
+recomb_chunk_size_MEMA %>%
+  ggplot(data =., aes(x = p_chunk_size)) +
+  geom_density(linewidth = 1) +
+  xlab("Recombination chunk size (cM)")  +
+  geom_vline(
+    data = recomb_med_max_p_size,
+    aes(xintercept = median_chunk_size_p),
+    color = "red",
+    linetype = "dashed",
+    linewidth = 1
+    ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    legend.position = "top"          
+    ) +
+  ggtitle("Distribution of the recombination chunk sizes in the MEMA population")
+
+```
+
+The median recombination chunk size is ~  4.20 MB, but they can go from almos 0 to >200 MB. It is kinda weird. The most probable thing is that those very small chunks are just mistakes in the haplotype calling and therefore the chunks are very small. Is also worth to mention that the missing information in the parentall haplotype calls seems to be located when one haplotype ends to when the other starts, so it seems that with this marker density (~ 14K markers), rqtl2 can't confidently assign a parental haplotype in these transition regions. 
+
+
+# What is the average size of the "same genotype" chunks in the parental magic haplotype?
+
+We hypothesize that rqtl2 is having trouble in calling parental haplotypes with confidence because there are chromosomic chunks where two or more parents have the same genotype, and with the actual marker density rqtl2 cannot tell apart one from the other. So we want to assess if including a greater number of markers (that come from WGS) can reduce the size of this chunks, therefore becoming easier to identify one parent from the other. In the other hand, it might be the case that even with a greater marker density the chunks stay about the same size, so including a genotype strategy to increase the marker density in the MEMA families will not be helpfull at all.
+
+```{r}
+
+# Import CHIP data
+
+mema_par_hap_raw <- 
+  read_delim(
+    "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/mosaic_estimates/gen_mosaic_estimates/magic_parents_HAPMAP.txt",
+    delim = "\t", 
+    escape_double = FALSE, 
+    trim_ws = TRUE
+    )
+
+colnames_WGS_data <- arrow::open_dataset(
+  sources = "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/mosaic_estimates/gen_mosaic_estimates/parents_WGS_hap.parquet"
+  )$schema$names
+
+parent_chip_MEMA <-  c("GD", "JL", "MS", "NT", "PT", "RV", "TB", "ZC")
+
+
+mema_par_hap <- 
+  mema_par_hap_raw %>%
+  select(marker = `rs#`, chrom, pos, contains("m_")) %>%
+  select(marker:pos, sort(names(.))) %>%
+  rename_with(.cols = contains("m_"), ~ c("GD", "JL", "MS", "NT", "PT", "RV", "TB", "ZC")) %>%
+  pivot_longer(-c(marker:pos), names_to = "parental", values_to = "geno")
+
+chip_parent_comp_mema <- 
+  crossing(p1 = parent_chip_MEMA, p2 = parent_chip_MEMA) %>%
+  filter(p1 != p2) %>%
+  mutate(code = map2_chr(
+    .x = p1,
+    .y = p2,
+    .f = ~ paste0(.x, .y) %>% str_split("") %>% unlist() %>% sort() %>% paste(collapse = "")
+    )) %>%
+  group_by(code) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(-code) %>%
+  left_join(mema_par_hap %>% rename(geno1 = geno), by = c("p1" = "parental")) %>%
+  left_join(mema_par_hap %>% rename(geno2 = geno), by = c("p2" = "parental", "marker", "chrom", "pos")) 
+
+chip_parent_chunk_info <- 
+  chip_parent_comp_mema %>%
+  mutate(comp_group = paste(p1, p2, sep ="-")) %>%
+  select(-c(p1, p2)) %>%
+  group_by(comp_group) %>%
+  nest() %>%
+  mutate(chunk_info = future_map(
+    .x = data,
+    .f = ~ .x %>%
+      group_by(chrom) %>%
+      rowid_to_column() %>%
+      filter(geno1 == geno2) %>%
+      mutate(
+        dif_inicio = lead(rowid) - rowid,
+        dif_final =  lag(dif_inicio)
+        ) %>%
+      filter(dif_inicio == 1 | dif_final == 1) %>%
+      mutate(block = ifelse(dif_inicio == 1, NA, rowid)) %>%
+      fill(block, .direction = "up") %>%
+      group_by(block) %>%
+      mutate(chunck_n_marker = n()) %>%
+      filter(rowid == min(rowid) | rowid == max(rowid)) %>%
+      group_by(chrom, block) %>%
+      summarise(
+        chunck_n_marker = first(chunck_n_marker),
+        chunk_size = diff(pos),
+        chunck_name = paste(first(rowid), last(rowid), sep = "-"),
+        spans = paste(round(first(pos)/1e6, 2), round(last(pos)/1e6, 2), sep ="-")
+        ) %>%
+      ungroup()
+  ))
+
+chip_parent_chunk_info_pre <- 
+  chip_parent_chunk_info  %>%
+  select(comp_group, chunk_info) %>%
+  ungroup() %>%
+  unnest(chunk_info) %>%
+  mutate(chunk_size = round(chunk_size/1e6, 2)) %>%
+  filter(chunk_size != 0)
+
+chip_parent_chunk_info_pre %>%
+  group_by(comp_group) %>%
+  summarise(
+    med_size = median(chunk_size),
+    max_size = max(chunk_size)
+    ) %>%
+  summarise(
+    med_size = median(med_size),
+    max_size = median(max_size)
+  )
+
+chip_parent_chunk_mema_label <- chip_parent_chunk_info_pre %>%
+  group_by(comp_group) %>%
+  summarise(
+    label = sapply(c("min", "max", "median"), do.call, list(x = chunk_size))  %>%
+      round(., 2) %>%
+      paste(names(.), ., sep = " = ") %>%
+      paste(., collapse = "\n"),
+    y = 1000,
+    chunk_size = 10
+  )
+
+chip_parent_chunk_info_pre %>%
+  ggplot(data =., aes(x = chunk_size, fill = comp_group )) +
+  geom_histogram(color = "black", linewidth = 0.75, bins = 30) +
+  geom_vline(
+    data = . %>% group_by(comp_group ) %>% summarise(chunk_size = median(chunk_size)),
+    aes(xintercept = chunk_size),
+    linetype = "dashed",
+    linewidth = 0.75
+  ) +
+  geom_text(
+    data = chip_parent_chunk_mema_label,
+    aes(label = label, x = chunk_size, y = y, hjust = "bottom"),
+  ) +
+  facet_wrap(. ~ comp_group, scales = "free_y") +
+  xlab("Chunk size (MB)") +
+  theme( 
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(),
+    ) + 
+  ggtitle('Distribution of "runs of identical sequence" for pairwise combination of MEMA parents using ~20K markers')
+  
+
+
+
+```
+
+In general the maximum size of the "same genotype" chunks seems to be 8-16 MB depending on the pairwise cross that is being analyzed. We expect to see a reduction in the size by using WGS (higher marker density)
+
+```{r}
+
+wgs_mema_parquet_source <- 
+  "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/mosaic_estimates/gen_mosaic_estimates/parents_WGS_hap.parquet"
+
+colnames_WGS_data <- 
+  arrow::open_dataset(sources = wgs_mema_parquet_source)$schema$names
+
+WGS_parents_raw <-
+  colnames_WGS_data[-c(1:11)] %>%
+  crossing(p1 =., p2 = .) %>%
+  filter(p1 != p2) %>%
+  mutate(code = map2_chr(
+    .x = p1,
+    .y = p2,
+    .f = ~ paste0(.x, .y) %>% str_split("") %>% unlist() %>% sort() %>% paste(collapse = "")
+    )) %>%
+  group_by(code) %>%
+  filter(row_number() == 1) %>%
+  ungroup() %>%
+  select(-code) %>%
+  mutate(
+    cols = map2(
+      .x = p1,
+      .y = p2,
+      .f = ~ c(colnames_WGS_data[c(1, 3, 4)], .x, .y)
+    )) %>%
+  mutate(comp_group_label = paste0(p1, "_", p2))
+
+
+downsize_scheme <- tibble(
+  n_marker = c(5000, 10000, 20000, 50000, 100000, 500000, 1e6, 3e6, 5e6, 8125930),
+  code = c("5k", "10k", "20k", "50K", "100K", "500K", "1M", "3M", "5M", "8.2M")
+  ) %>%
+  mutate(prop = n_marker/8125930) 
+
+# for (j in 10) {
+#   
+#   for (i in 1:dim(WGS_parents_raw)[1]) {
+#     
+#     wgs_data_pre <- read_parquet(file = "parents_WGS_hap.parquet", col_select = all_of(WGS_parents_raw$cols[[i]])) %>%
+#       rename_with(~c("marker", "chrom", "pos", "geno1", "geno2"))
+#     
+#     if (j == dim(downsize_scheme)[1]) {
+#       
+#       wgs_magic_chunks_data_pre <- wgs_data_pre
+#       
+#     } else {
+#         
+#       set.seed(100)
+#       wgs_data_split <- initial_split(wgs_data_pre, prop = downsize_scheme$prop[j], strata = chrom)
+#       wgs_magic_chunks_data_pre <- training(wgs_data_split)
+#       
+#     }
+#     
+#     wgs_magic_chunks <- 
+#       wgs_magic_chunks_data_pre %>%
+#       group_by(chrom)  %>%
+#       rowid_to_column() %>%
+#       filter(geno1 == geno2) %>%
+#       mutate(
+#         dif_inicio = lead(rowid) - rowid,
+#         dif_final =  lag(dif_inicio)
+#         ) %>%
+#       filter(dif_inicio == 1 | dif_final == 1) %>%
+#       mutate(block = ifelse(dif_inicio == 1, NA, rowid)) %>%
+#       fill(block, .direction = "up") %>%
+#       group_by(block) %>%
+#       mutate(chunck_n_marker = n()) %>%
+#       filter(rowid == min(rowid) | rowid == max(rowid)) %>%
+#       group_by(chrom, block) %>%
+#       summarise(
+#         chunck_n_marker = first(chunck_n_marker),
+#         chunk_size = diff(pos),
+#         chunck_name = paste(first(rowid), last(rowid), sep = "-"),
+#         spans = paste(round(first(pos)/1e6, 2), round(last(pos)/1e6, 2), sep ="-")
+#         ) %>%
+#       ungroup() %>%
+#     mutate(chunk_size = round(chunk_size/1e6, 2)) %>%
+#     filter(chunk_size > 0) 
+#   
+#   SINK <- paste0(WGS_parents_raw$comp_group_label[i], "_", downsize_scheme$code[j], "_chunk_info.parquet")
+#   
+#   write_parquet(wgs_magic_chunks, sink = SINK)
+#   
+#   rm(wgs_data_pre, wgs_data_split, wgs_magic_chunks_data_pre, wgs_magic_chunks, SINK)
+#   gc()
+#   
+#   }
+# }
+
+parents_mema_gws_all_data <-
+  WGS_parents_raw %>%
+  select(comp_group_label) %>%
+  mutate(ds = list(downsize_scheme)) %>%
+  unnest(ds) %>%
+  mutate(file = paste0(
+    "C:/Users/sergi/Documents/SAWERS LAB/MAGIC/mosaic_estimates/gen_mosaic_estimates/",
+    comp_group_label, 
+    "_", code,
+    "_chunk_info.parquet")) %>%
+  mutate(data = map(
+    .x = file,
+    .f = ~ read_parquet(.x)
+  ))
+
+WGS_parents_chunk_sizes <- 
+  parents_mema_gws_all_data %>%
+  unnest(data) %>%
+  group_by(comp_group_label, n_marker) %>%
+  summarise(
+    min_chunk_size = min(chunk_size),
+    med_chunk_size = median(chunk_size),
+    max_chunk_size = max(chunk_size),
+    code = first(code)
+    )
+
+
+WGS_parents_chunk_sizes %>% 
+  group_by(n_marker, code) %>%
+  pivot_longer(contains("chunk_size")) %>%
+  ungroup() %>%
+  filter(name != "min_chunk_size") %>%
+  group_by(code, name) %>%
+  filter(value == min(value) | value == max(value)) %>%
+  ungroup() %>%
+  select(-comp_group_label) %>%
+  distinct() %>%
+  arrange(n_marker, name) %>%
+  group_by(n_marker, code, name) %>%
+  summarise(interval = paste(value, collapse = " - ")) %>%
+  pivot_wider(names_from = name, values_from = interval)
+
+WGS_parents_med_chunk_sizes_plot <- 
+  WGS_parents_chunk_sizes %>%
+  mutate(
+    code = as_factor(code)) %>% 
+  ggplot(
+    data =., 
+    aes(x = n_marker, y = med_chunk_size, color = comp_group_label, group = comp_group_label)
+  ) +
+  geom_line(linewidth = 0.75) +
+  scale_x_continuous(
+    breaks = unique(WGS_parents_chunk_sizes$n_marker),
+    labels = unique(WGS_parents_chunk_sizes$code)
+  ) +
+  xlab("Number of markers") +
+  ylab("Median chunk size (MB)") +
+  ggtitle('Reduction in "same genotype chunk" size when marker density is increased') +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0),
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+    ) 
+
+WGS_parents_med_chunk_sizes_plot
+
+WGS_parents_med_chunk_sizes_plot +
+  scale_x_log10(
+    breaks = unique(WGS_parents_chunk_sizes$n_marker),
+    labels = unique(WGS_parents_chunk_sizes$code)
+  ) 
+
+WGS_parents_max_chunk_sizes_plot <-
+  WGS_parents_chunk_sizes %>%
+  mutate(
+    code = as_factor(code)) %>% 
+  ggplot(
+    data =., 
+    aes(x = n_marker, y = max_chunk_size, color = comp_group_label, group = comp_group_label)
+  ) +
+  geom_line(linewidth = 0.75) +
+  scale_x_continuous(
+    breaks = unique(WGS_parents_chunk_sizes$n_marker),
+    labels = unique(WGS_parents_chunk_sizes$code)
+  ) +
+  xlab("Number of markers") +
+  ylab("Maximum chunk size (MB)") +
+  ggtitle('Reduction in "same genotype chunk" size when marker density is increased') +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0),
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+    ) 
+
+WGS_parents_max_chunk_sizes_plot
+
+WGS_parents_max_chunk_sizes_plot +
+  scale_x_log10(
+    breaks = unique(WGS_parents_chunk_sizes$n_marker),
+    labels = unique(WGS_parents_chunk_sizes$code)
+  ) 
+
+dif_chunk_size_par <- 
+  WGS_parents_chunk_sizes %>%
+  group_by(comp_group_label) %>%
+  mutate(
+    dif_med = med_chunk_size - lead(med_chunk_size),
+    dif_max = max_chunk_size - lead(max_chunk_size),
+    code2 = lead(code),
+    code2 = paste0(code, "-", code2)
+    ) %>%
+  filter(!is.na(dif_med)) %>%
+  mutate(code2 = as_factor(code2)) 
+
+dif_chunk_size_par %>%
+  ggplot(
+    data =., 
+    aes(x = code2, y = dif_med, color = comp_group_label, group = comp_group_label)) +
+  geom_line()  +
+  xlab(NULL) +
+  ylab("Median chunk size (MB)") +
+  ggtitle('Difference in the median chunk size as the number of markers is increased') +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0),
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+    ) 
+
+dif_chunk_size_par %>%
+  ggplot(
+    data =., 
+    aes(x = code2, y = dif_max, color = comp_group_label, group = comp_group_label)) +
+  geom_line()  +
+  xlab(NULL) +
+  ylab("Median chunk size (MB)") +
+  ggtitle('Difference in the maximum chunk size as the number of markers is increased') +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),  
+    text = element_text(size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 0),
+    legend.title = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+    ) 
+
+
+```
+
+We hypothesize that the big amount of missing information in the assignment of a parental haplotypes for markers in the MEMA population is because at the actual marker density (~ 15K markers) rqtl2 cannot differentiate between any parent with a 95% of confidence, thus generating missing information. This leads us to think that is because there are genomic regions in the parents that have "identical genotype (IBD?)", making difficult or impossible for qtl2 to differentiate one parent from the other. So we think that if we can reduce the size of this "same genotype" regions by identifying polymorphic markers across each pair of parents, we can give more information to rqtl2 to assign a parental haplotype and reduce the number of misscalling.
+
+The question here is: how big are this regions? and If we increase the genome-wide marker density, can we reduce the size of this regions? Can we add more information with more markers? How many markers do we need to add more information and reduce the size of the "same genotype chunks"?
+
+To answer these questions we assess the size of the "same genotype" regions in each pairwise combination of the parents of the MEMA population by using the 50K CHIP marker data (~ 15K SNPs) and WGS data (~8.2M SNPs). We use a "down-scale" simulation with the WGS data, where we randomly sampled markers across the genome with the same proportion of markers per chromosome as the original dataset, to assess if we can observe a gradient of how much information we acquire (in terms of reduction of the size of the same genotype chunks) as we increase the marker density. We selected 5000, 10,000, 20,000, 100,000, 1,000,000, 3,000,000, 5,000,000 and 8,200,000 markers to answer this question.
+
+For the CHIP dataset, the same chunk genotype median and max size can go from 0.17-0.24 MB and 5.09-19 MB respectively. For WGS data, we can observe that an increase of the number of markers leads to the reduction of the median and max same genotype chunk size, for instance, with 50,000 markers we get a median chunk size from 0.13 - 0.23 MB and max size of 7.57 - 22.21 MB, and as we increase the marker density we observe a reduction in these values. So we can conclude that more dense marker data increases the information on the parents of the MEMA population. So it is worth to find a genotyping way that can increase the density of markers, like skim sequencing + imputation.

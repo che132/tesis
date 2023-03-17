@@ -5,7 +5,7 @@ format: html
 editor_options: 
   chunk_output_type: console
 execute: 
-  echo: false
+  freeze: true
 ---
 
 Here I use the FieldHub app to design the field evaluation of the CML F2:3 population, for the Highlands we're using a p-rep design (more info: 10.1198/108571106X154443). In total there are going to be 210 genotypes of the HI73 and HI93 populations, 320 from the HI79 and Hermes as a CHECK evaluated in two locations. For this experimental design, 70 genotypes of each biparental population are going to be replicated, and the rest (140, 140 and 250 respectively) are going as single reps. The families are selected based on the phc BLUP value. It is important to note that we're only removing a few families based on this, so there is not an important bias/selection towards the best genotypes, but it might help us to select families that are going to survive. We select the families that are going to be repeated randomly. Check is repeated 50 times. The ecperiment is designed for a 25 columns x 40 rows experiment.

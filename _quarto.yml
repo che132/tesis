@@ -9,6 +9,8 @@ book:
     - index.qmd
     - intro.qmd
     - part: MAGIC.qmd
+      chapters: 
+        - mosaic_metrics_pretty.qmd
     - part: CML.qmd
       chapters:
         - "CML-2023-03-12-23_Highland_Ameca_Experimental_Design.qmd"
@@ -24,6 +26,9 @@ format:
     theme: cosmo
   pdf:
     documentclass: book
+  docx: default
+    
+    
 
 
 
