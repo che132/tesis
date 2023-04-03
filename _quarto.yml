@@ -10,9 +10,10 @@ book:
     - intro.qmd
     - part: MAGIC.qmd
       chapters: 
-        - mosaic_metrics_pretty.qmd
+        - "MAGIC-2023-03-30-Recombination-mosaic_metrics_estimation.qmd"
     - part: CML.qmd
       chapters:
+        - "CML-2023-03-30-Data-Analysis-2022-Highland-Experiment.qmd"
         - "CML-2023-03-12-23_Highland_Ameca_Experimental_Design.qmd"
     - PT.qmd
     - AMF.qmd

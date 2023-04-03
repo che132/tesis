@@ -1,0 +1,1108 @@
+---
+title: "22_Highland_Experiments_Analysis"
+author: "Sergio Pérez-Limón"
+format: html
+editor_options: 
+  chunk_output_type: console
+execute: 
+  freeze: true
+---
+
+The data from the 4 sites was collected by María Cecilia Arroyo et al. from UNISEM. I will draw the final field shape from the annotations on the field and try to using Patrick's kriegging methodology with the checks to try to account for spatial variation across each field. 
+
+
+Loading libraries and functions
+
+```{r}
+library(Boruta)
+library(lme4)
+library(lmerTest)
+library(googledrive)
+library(googlesheets4)
+gs4_auth("checo.spl@gmail.com")
+library(gstat)
+library(sp)
+library(stars)
+library(variosig)
+library(ggbiplot)
+library(factoextra)
+library(furrr)
+library("doFuture")
+library(tidyverse)
+library(caret)
+library(catboost)
+library(tidymodels)
+library(furrr)
+library(googlesheets4)
+library(googledrive)
+library(magrittr)
+library(tidyverse)
+plan(multisession)
+library(lme4)
+library(lmerTest)
+
+
+all_cores <- parallel::detectCores(logical = FALSE) - 1
+registerDoFuture()
+cl <- parallel::makeCluster(all_cores)
+plan(future::cluster, workers = cl)
+
+coordinates_wrapper <- function(data) {
+  
+  a <- data
+  
+  gridded(a) <- ~ x + y
+  return(a)
+  
+}
+
+grid_wrapper <- function(data) {
+  
+  a <- data %>%
+    select(x, y)
+  
+  coordinates(a) <- ~ x + y
+  return(a)
+  
+}
+
+spatial_significance <- function(spatial_data){
+  
+  TheVariogram <- 
+    variogram(
+      value ~ 1, 
+      data = spatial_data
+      )
+  
+  varioEnv <- envelope(
+    TheVariogram, 
+    data = spatial_data,
+    formula = value ~ 1,
+    nsim = 999,
+    cluster = FALSE
+    )
+  
+  test <- envsig(varioEnv, index = 2, method = "eb")
+  
+  test_result <- test$p.overall[1] 
+  
+  return(test_result)
+  
+}
+
+vrg_plot <- function(vrg, fit_vrg) {
+  d <-
+  variogramLine(fit_vrg, max(vrg$dist))
+  ggplot(data = vrg, aes(x = dist, y = gamma)) +
+    geom_point(
+      shape = 21,
+      fill = "red",
+      color = "black",
+      size = 2
+      ) +
+    geom_line(
+      data = d,
+      linewidth = 1
+      ) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      panel.background = element_rect(fill = "white", colour ="grey50"),
+      legend.title=element_blank()
+    )
+}
+
+std_field_design <- function(plots, rows) {
+  
+  franjas <- ceiling(plots/rows)
+  
+  tibble(
+    row = c(1:plots),
+    range = rep(c(1:franjas), rows) %>% sort() %>% .[1:plots],
+    x = rep_len(c(1:rows), plots)
+    ) %>%
+    group_by(range) %>%
+    mutate(x = ifelse(range %% 2 == 0, rev(x), x)) %>%
+    ungroup() 
+  }
+
+estimate_field <- function(design, WIDTH, LENGTH, STREET){
+  
+  a <- 
+    design %>%
+    mutate(
+      width = WIDTH,
+      length = LENGTH,
+      calle = STREET
+    ) %>%
+    group_by(range) %>%
+    mutate(
+      x0a = (x -1)*2,
+      x0b = x0a + 1,
+      xmin = x0a * width,
+      xmax = x0b * width,
+    ) %>%
+    select(-c(x0a, x0b)) %>%
+    ungroup()
+  b <- 
+    a %>%
+    group_by(range) %>%
+    filter(row_number() == 1) %>%
+    ungroup() %>%
+    mutate(
+      y0a = (range-1)*2,
+      y0b = range * length,
+      ycalle = calle * (range-1),
+      ymin = ifelse(y0a == 0, 0, lag(y0b) + ycalle),
+      ymax = ifelse(y0a == 0, y0b, y0b + ycalle)
+        ) %>%
+    select(range, ymin, ymax)
+  a %>%
+    left_join(b)
+  
+  
+}
+
+```
+
+Import phenotypic data
+
+```{r}
+Francisco_Villa_url <-
+  "https://docs.google.com/spreadsheets/d/1uVTRsyPz4vZVLTj8c9WZ5nnYPmx59RO3qbsQT9RjT_Q/edit#gid=0"
+
+San_Felipe_url <- 
+  "https://docs.google.com/spreadsheets/d/1GCnHb4n60kPRfXKiJ73lmDyy9FrTZDlF1PFW0n_B6HM/edit#gid=0"
+
+Epitacio_Huerta_url <-
+  "https://docs.google.com/spreadsheets/d/1p8G7Fs5hVgTFXUy_HJPhVhUl9JH9r3RVs9erOYjocyo/edit#gid=0"
+
+San_Bernardo_url <-
+  "https://docs.google.com/spreadsheets/d/1Coicg8TVkVzQt6iRGg_nHgOY35ijlkqpQXmcz3CsQac/edit#gid=0"
+
+
+cml_data_colnames <-
+  c("row", "family", "pop", "origin", "phc", "humidity", "anthesis", "ph", "eh", "sg", "pn", "en",
+    "es", "obs") 
+
+raw_pheno_data <-
+  ls() %>%
+  .[grepl("url", .) & grepl("^[A-Z]", .)] %>%
+  as.list() %>%
+  setNames(c("EH", "FV", "SB", "SF")) %>%
+  map_df(
+    .x = .,
+    .f = ~ eval(parse(text = .x)) %>%
+      as_id() %>%
+      range_read(., skip = 3, col_names = F) %>%
+      rename_with(~ cml_data_colnames),
+    .id = "location"
+    )
+
+```
+
+Make maps of the each field design
+
+```{r}
+
+CML_experiment_meta_url <- "https://docs.google.com/spreadsheets/d/14yHP2kqQZQ-wp0IdiUgeUeQIeqorQed3-m-xcwFu_Ko/edit#gid=947922057"
+  
+field_design_info <-
+  CML_experiment_meta_url %>%
+  as_id() %>%
+  range_read(ss =., sheet = "Overview", range = "A28:D33") 
+
+highland_field_design_pre <- 
+  field_design_info %>%
+  mutate(plots = c(rep(1000, 2), 924, 76, 1000)) %>%
+  mutate(field = map2(
+    .x = columns, .y = plots, .f = ~ std_field_design(.y, .x)
+  )) %>%
+  unnest(field) %>%
+  select(-c(columns, rows, plots))
+
+high_22_field_coord_pre <- 
+  highland_field_design_pre %>%
+  mutate(
+    x = ifelse(location == "San Felipe del Progreso A", x + 29, x),
+    range = ifelse(location == "San Felipe del Progreso B", range + 84, range),
+    row = ifelse(location == "San Felipe del Progreso B", row + 924, row)
+    
+  ) %>%
+  group_by(code) %>%
+  nest() %>%
+  mutate(field_design = map(
+    .x = data,
+    .f = ~ estimate_field(design = .x, WIDTH = 0.75, LENGTH = 1, STREET = 1)
+  )) %>%
+  select(-data) 
+
+high_22_field_coord_plots <- 
+  high_22_field_coord_pre %>%
+  mutate(plot = map2(
+    .x = field_design,
+    .y = code,
+    .f = ~ .x %>%
+      ggplot(
+        data =.,
+        aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = location)
+        ) +
+      geom_rect() +
+      ggtitle(paste0("Field design ", .y, " 2022")) +
+      theme(
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+          text = element_text(size = 12),
+          ) +
+      coord_equal() 
+      ))
+
+high_22_field_coord_plots$plot
+
+# Saving plots into a single pdf
+ggsave(
+  filename = "field_distribution_highlands_22.pdf", 
+  plot = gridExtra::marrangeGrob(high_22_field_coord_plots$plot, nrow = 1, ncol = 1), 
+  width = 15,
+  height = 9
+  )
+
+```
+
+Check data for possible mistakes in the phenotyping
+
+Note: there was a point in Los Dolores field where instead of being 178 it is 1.78; also most of the data that should have been NA is indicated as 0, so I will NA these.
+
+```{r}
+
+raw_pheno_checked <- 
+  raw_pheno_data %>%
+  mutate(phc = ifelse(phc == 178 & location == "EH", 1.78, phc))
+
+raw_data_raincloud_plots <- raw_pheno_checked %>%
+  select(location, pop, phc:es) %>%
+  select(-humidity) %>%
+  mutate(pop = ifelse(is.na(pop), "HERMES", pop)) %>%
+  mutate(phc = as.double(phc)) %>%
+  pivot_longer(c(phc:es), names_to = "phenotype") %>%
+  filter(value != 0) %>%
+  group_by(phenotype) %>%
+  nest() %>%
+  mutate(plot = map(
+    .x = data,
+    .f = ~ .x %>%
+      ggplot(data =., aes(x = pop, y = value, fill = pop)) + 
+      ggdist::stat_halfeye(
+        adjust = .5, 
+        width = .6, 
+        .width = 0, 
+        justification = -.2, 
+        point_colour = NA
+        ) + 
+      geom_boxplot(
+        width = .15, 
+        outlier.shape = NA
+        ) +
+      gghalves::geom_half_point(
+        side = "l", 
+        range_scale = .4, 
+        alpha = .25,
+        shape = 21
+        ) +
+      coord_cartesian(xlim = c(1.2, NA), clip = "off") +
+      facet_grid(. ~ location) +
+      theme(
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+        legend.position = "top",
+        text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5)
+        ) +
+      xlab(NULL)
+  )) %>%
+  mutate(plot = map2(
+    .x = plot,
+    .y = phenotype,
+    .f = ~ .x + ggtitle(.y)
+  ))
+
+p <- raw_data_raincloud_plots$plot
+
+# Saving plots into a single pdf
+ggsave(
+  filename = "raw_data_raincloud_plots.pdf", 
+  plot = gridExtra::marrangeGrob(p, nrow = 1, ncol = 1), 
+  width = 15,
+  height = 9
+  )
+
+
+
+
+```
+
+plot the field with phenotypes to check possible spatial effects
+
+```{r}
+
+pheno_plots_effect_pre <- 
+  raw_pheno_checked %>%
+  left_join(
+    .,
+    high_22_field_coord_pre %>%
+      unnest(field_design) %>%
+      select(-location) %>%
+      dplyr::rename(location = code)
+  ) %>%
+  mutate(
+    pop = ifelse(is.na(pop), "HERMES", pop),
+    phc = as.double(phc)) %>%
+  pivot_longer(c(phc:es), names_to = "phenotype") %>%
+  filter(value != 0)
+
+pheno_plots_effect <- 
+  pheno_plots_effect_pre %>%
+  group_by(location, phenotype) %>%
+  nest() %>%
+  mutate(label = paste0(location, " - ", phenotype)) %>%
+  mutate(plot = map2(
+    .x = data,
+    .y = label,
+    .f = ~ .x %>%
+      ggplot(
+        data =.,
+        aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax, fill = value)
+        ) +
+      geom_rect() +
+      ggtitle(paste0("Spatial values for ", .y, " 2022")) +
+      theme(
+        panel.background = element_rect(fill = "white", colour = "grey50"),
+          text = element_text(size = 12),
+          ) +
+      coord_equal() +
+      scale_fill_gradient(low = "blue", high = "red", na.value = NA)
+      ))
+
+p <- pheno_plots_effect$plot
+
+p
+
+# Saving plots into a single pdf
+ggsave(
+  filename = "spatial_effect_pheno.pdf", 
+  plot = gridExtra::marrangeGrob(p, nrow = 1, ncol = 1), 
+  width = 15,
+  height = 9
+  )
+
+```
+
+Krigging the data
+
+```{r}
+
+highland_pheno_data <- 
+  pheno_plots_effect_pre %>%
+  select(location, family, row, range, x, phenotype, value) %>%
+  filter(phenotype %in% c("anthesis", "eh", "en", "ph", "phc")) %>%
+  pivot_wider(names_from = phenotype) %>%
+  dplyr::rename(y = range)
+
+highland_spatial_info_df <- 
+  raw_pheno_checked %>%
+  left_join(
+    .,
+    high_22_field_coord_pre %>%
+      unnest(field_design) %>%
+      select(-location) %>%
+      ungroup() %>%
+      dplyr::rename(location = code)
+  ) %>%
+  mutate(
+    pop = ifelse(is.na(pop), "HERMES", pop),
+    phc = as.double(phc)) %>%
+  select(-c(origin, humidity, sg, obs, width, length, calle, xmin, xmax, ymin, ymax)) %>%
+  dplyr::rename(y = range) 
+
+spatial_significance <- function(spatial_data){
+  
+  TheVariogram <- 
+    variogram(
+      value ~ 1, 
+      data = spatial_data
+      )
+  
+  varioEnv <- envelope(
+    TheVariogram, 
+    data = spatial_data,
+    formula = value ~ 1,
+    nsim = 999,
+    cluster = FALSE
+    )
+  
+  test <- envsig(varioEnv, index = 2, method = "eb")
+  
+  test_result <- test$p.overall[1] 
+  
+  
+  return(test_result)
+  
+}
+
+highland_variogram_models <- 
+  highland_spatial_info_df %>%
+  filter(family == "HERMES") %>%
+  select(location, x,y, phc:es) %>%
+  select(-where(~all(is.na(.)))) %>%
+  pivot_longer(-c(x,y, location), names_to = "phenotype") %>%
+  group_by(phenotype, location) %>%
+  nest() %>%
+  mutate(spatial_data = map(
+    .x = data,
+    .f = ~ coordinates_wrapper(.x)
+  )) %>%
+  mutate(grid = map(
+    .x = data,
+    .f = ~ coordinates_wrapper(.x)
+  )) %>%
+  mutate(significant = map_dbl(
+    .x = spatial_data,
+    .f = ~ {
+      set.seed(100)
+      spatial_significance(.x)
+    } 
+  )) %>%
+  mutate(vrg = map(
+    .x = spatial_data,
+    .f = ~ {
+      set.seed(100)
+      variogram(value ~ 1, data = .x)
+    } 
+  )) %>%
+  mutate(fit_vrg = map(
+    .x = vrg,
+    .f = ~ {
+      set.seed(100)
+      fit.variogram(.x, vgm(c("Exp", "Mat", "Sph", "Gau")))
+    }
+  )) %>%
+  mutate(vgm_model = map_chr(
+    .x = fit_vrg,
+    .f = ~ as.character(.x$model[2])
+  )) %>%
+  mutate(range = map_dbl(.x = fit_vrg, .f = ~ .x$range[2])) %>%
+  filter(range > 0) %>%
+  ungroup()
+
+# Selecting significant variables (p < 0.05) or arbitrarily picking the three variables with a smaller p value
+
+highland_variogram_plot <- 
+  highland_variogram_models %>%
+  mutate(
+    plot = future_pmap(
+      .options = furrr_options(seed = 100),
+      .l =.,
+      .f = ~ with(
+        list(...),
+        vrg_plot(vrg, fit_vrg) + ggtitle(paste0(phenotype, " ", vgm_model))
+        )
+      )
+  ) 
+
+highland_krigged_models <- 
+  highland_spatial_info_df %>%
+  select(location, x, y) %>%
+  group_by(location) %>%
+  nest() %>%
+  mutate(loc_gridded = map(.x = data, .f = ~coordinates_wrapper(.x))) %>%
+  select(-data) %>%
+  left_join(highland_variogram_models, .) %>%
+  mutate(krige.model = future_pmap(
+    .options = furrr_options(seed = 100),
+    .l =.,
+    .f = ~ with(
+      list(...),
+      krige(
+        formula = value ~ x + y,
+        grid,
+        loc_gridded,
+        fit_vrg
+        ) %>%
+        as_tibble() %>%
+        select(x, y, var1.pred) 
+    )
+  ))
+
+
+highland_pca_estimation <- 
+  highland_krigged_models %>%
+  select(location, phenotype, krige.model) %>%
+  ungroup() %>%
+  unnest(krige.model) %>%
+  group_by(location) %>%
+  nest() %>%
+  mutate(data = map(
+    .x = data, 
+    .f = ~ .x %>%
+      pivot_wider(names_from = phenotype, values_from = var1.pred) 
+    )) %>%
+  mutate(pca = future_map(
+    .options = furrr_options(seed = 100),
+    .x = data,
+    .f = ~ {
+      set.seed(100)
+      .x %>%
+        select(-c(x,y)) %>% 
+        prcomp(
+          x = .,
+          center = TRUE, 
+          scale = TRUE
+          )
+    } 
+    )) %>%
+  mutate(
+    pca_plot = map(
+      .x = pca,
+      .f = ~ ggbiplot(.x, ellipse = FALSE) + theme_minimal()
+    )
+  ) %>%
+  mutate(
+    pca_var_exp_plot = map(
+      .x = pca,
+      .f = ~ fviz_eig(.x)
+    )) %>%
+  mutate(
+    pca_values = map(
+      .x = pca,
+      .f = ~ .x$x %>% as_tibble %>% select(PC1)
+    ))
+
+# Print krigged maps
+for (j in 1:4) {
+  
+  lugar <- highland_pca_estimation$location[[j]]
+  datos_grid <- highland_pca_estimation$data[[j]]
+  gridded(datos_grid) = ~x+y
+  
+  pdf(paste0("./krigged_variables_", lugar, ".pdf"))
+  for(i in 1:length(names(datos_grid))) {
+  print(
+    spplot(
+      datos_grid,
+      paste(names(datos_grid)[i]), # don't paste here... list variable...
+      main = paste0(lugar, " 2022"), 
+      sub = paste(names(datos_grid)[i]), 
+      col = "transparent")
+  )
+  }
+  
+  dev.off()
+}
+
+highland_boruta_all <- 
+  highland_pca_estimation %>%
+  select(location, data, pca_values) %>%
+  unnest(c(data, pca_values)) %>%
+  select(x, y, PC1) %>%
+  ungroup() %>%
+  left_join(highland_spatial_info_df, .) %>%
+  select(-c(row)) %>%
+  pivot_longer(phc:es, names_to = "phenotype") %>%
+  filter(value != 0) %>%
+  group_by(location, phenotype) %>%
+  nest() %>%
+  mutate(boruta = future_map(
+    .options = furrr_options(seed = 100),
+    .x = data,
+    .f = ~ Boruta(value ~ ., data = .x)
+  ))
+
+boruta_by_phenotype <- 
+  highland_pca_estimation %>%
+  select(location, data, pca_values) %>%
+  unnest(c(data, pca_values)) %>%
+  select(x, y, PC1) %>%
+  ungroup() %>%
+  left_join(highland_spatial_info_df, .) %>%
+  select(-c(row)) %>%
+  pivot_longer(phc:es, names_to = "phenotype") %>%
+  filter(value != 0) %>%
+  group_by(phenotype) %>%
+  nest() %>%
+  mutate(boruta = future_map(
+    .options = furrr_options(seed = 100),
+    .x = data,
+    .f = ~ Boruta(value ~ ., data = .x)
+  ))
+
+highland_22_pc_data_pre <- 
+  highland_pca_estimation %>%
+  select(location, data, pca_values) %>%
+  unnest(c(data, pca_values)) %>%
+  select(x, y, PC1) %>%
+  ungroup() %>%
+  left_join(highland_spatial_info_df, .) %>%
+  mutate(across(c(phc, anthesis, ph, eh), ~ ifelse(. ==0, NA_real_, .))) %>%
+  mutate(across(
+    c(phc, anthesis, ph, eh, en, es), ~ ifelse(pn ==0, NA_real_, .))
+    )
+
+high_22_design_info_raw <- 
+  CML_experiment_meta_url %>%
+  as_id() %>%
+  range_read(sheet = "22_Highland_Raw_data_tidy", na = c(" ", "NA"))
+
+highland_22_pheno_data <- 
+  highland_22_pc_data_pre %>%
+  left_join(
+    high_22_design_info_raw %>%
+      select(location:family, replication:nblock, sg)
+  ) %>%
+  select(location:es, sg, y:nblock) %>%
+  mutate(across(
+    c(sg), ~ ifelse(pn ==0, NA_real_, .))
+    )
+
+write_sheet(
+  data = highland_22_pheno_data,
+  ss = as_id(CML_experiment_meta_url),
+  "highland_22_pheno_data_pre_BLUP"
+  )
+
+```
+
+Obtain BLUPs
+
+```{r}
+CML_experiment_meta_url <- "https://docs.google.com/spreadsheets/d/14yHP2kqQZQ-wp0IdiUgeUeQIeqorQed3-m-xcwFu_Ko/edit#gid=947922057"
+
+highland_22_pheno_data <- CML_experiment_meta_url %>%
+  as_id() %>%
+  range_read(sheet = "highland_22_pheno_data_pre_BLUP")
+
+family_levels <- 
+  highland_22_pheno_data$family %>%
+  unique() %>% 
+  .[. != "HERMES"] %>%
+  sort()
+
+
+# example using ph as phenotype
+blup_data_example <- 
+  highland_22_pheno_data %>%
+  select(location, family, pop, PC1, x, y, nblock, value = anthesis) %>%
+  filter(family != "HERMES") %>%
+  mutate(
+    location = as_factor(location),
+    family = factor(family, levels = family_levels),
+    pop = as_factor(pop),
+    nblock = as_factor(nblock)
+    )
+
+summary(blup_data_example)
+
+
+model01 <- value ~ location + (1|family)
+model02 <- value ~ location + nblock + (1|family)
+model03 <- value ~ location + PC1 + (1|family)
+model04 <- value ~ location + location/nblock + (1|family)
+model05 <- value ~ location + location/PC1 + (1|family)
+
+
+models <-
+  ls() %>%
+  .[grepl("^model\\d{1,2}$", .)] %>%
+  list()
+
+high_22_models_all_phenos <- 
+  highland_22_pheno_data %>%
+  select(location, family, pop, nblock, PC1, phc:sg) %>%
+    filter(family != "HERMES") %>%
+  mutate(
+    location = as_factor(location),
+    family = factor(family, levels = family_levels),
+    pop = as_factor(pop),
+    nblock = as_factor(nblock)
+    ) %>%
+  pivot_longer(phc:sg, names_to = "phenotype") %>%
+  group_by(phenotype) %>%
+  nest() %>%
+  mutate(
+    model = models
+  ) %>%
+  unnest(model) %>%
+  mutate(lmm = map2(
+    .x = model, 
+    .y = data,
+    .f = ~ 
+      {
+        set.seed(100)
+        lmer(formula = eval(parse(text = .x)), data = .y, REML = T)
+      }
+  )) %>%
+  mutate(lmm_noREML = map2(
+    .x = model, 
+    .y = data,
+    .f = ~ 
+      {
+        set.seed(100)
+        lmer(formula = eval(parse(text = .x)), data = .y, REML = F)
+      }
+  )) %>%
+  mutate(aic = map_dbl(
+    .x = lmm_noREML, 
+    .f = ~ 
+      {
+        set.seed(100)
+        AIC(.x)
+      }
+  )) %>%
+  mutate(
+    H2 = map_dbl(
+      .x = lmm, 
+      .f = ~ bwardr::Cullis_H2(.x, "family")[[2]])
+  ) 
+
+high_22_models_all_phenos %>%
+  select(phenotype, model, aic, H2) %>%
+  mutate(aic = round(aic, 0), H2 = round(H2, 2)) %>%
+  ungroup()
+
+high_22_models_all_phenos %>%
+  ggplot(data = ., aes(x = model, y = H2)) +
+  geom_boxplot(color = "black", fill = NA) +
+  geom_point(aes(color = phenotype), size = 3) +
+  scale_color_discrete(
+    labels = c("Anthesis", "Ear Height", "Ear Number", "Ear Score", "Plant Height", "Field Weight", "Plant Number", "Stay Green"),
+    ) +
+  theme(
+    panel.background = element_rect(fill = "white", colour = "grey50"),
+    text = element_text(size = 12),
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  xlab(NULL) +
+  ylab("Estimated Broad Sense Heritability") +
+  scale_x_discrete(
+    labels = c(
+      "value ~ location + (1 | family)", 
+      "value ~ location + nblock + (1 | family)", 
+      "value ~ location + PC1 + (1 | family)",
+      "value ~ location + location/nblock + (1|family)",
+      "value ~ location + location/PC1 + (1|family)"
+      )
+    ) +
+  ggtitle("Distribution of estimated H2 for different models for CML highland 2022 experiment")
+
+# Estimate BLUPs
+
+higland_22_BLUP <- 
+  high_22_models_all_phenos %>%
+  filter(model %in% c("model04")) %>%
+  select(phenotype, lmm) %>%
+  mutate(BLUP = map(
+    .x = lmm,
+    .f = ~ .x %>%
+      ranef() %>%
+      .$family %>%
+      as_tibble(rownames = "family") %>%
+      rename_with(.cols = -family, ~c( "BLUP"))
+    )) %>%
+  mutate(phenotype = paste0(phenotype, "_BLUP")) %>%
+  select(-lmm) %>%
+  unnest(BLUP) %>%
+  pivot_wider(names_from = phenotype, values_from = BLUP)
+
+higland_22_BLUP %>%
+  mutate(pop = gsub("-\\d{3}$", "", family)) %>%
+  pivot_longer(contains("BLUP")) %>%
+  ggplot(data =., aes(x = value, fill = pop, )) +
+  geom_density(color = "black", alpha = 0.5) +
+  geom_vline(
+    data = . %>% group_by(name, pop) %>% summarise(value = median(value)),
+    aes(xintercept = value, color = pop),
+    linetype = "dashed",
+    linewidth = 0.75
+  ) +
+  facet_wrap(. ~ name, scales = "free") +
+  xlab("median BLUP value") +
+  ggtitle("Distribution of the estimated median family BLUP value per population") +
+  theme(
+      plot.title = element_text(hjust = 0.5),
+      panel.background = element_rect(fill = "white", colour ="grey50"),
+      text = element_text(size = 12)
+    ) 
+
+```
+
+Machine Learning to obtain an additive estimate of the family effect in the experiment using catboost.
+
+In this case I'm using catboost, a boosting gradient algorithm to estimate the median SHAP value per family, which I think might be the equivalent to a family BLUP used for mapping. A SHAP value is an estimate of the additive contribution of each feature to the predicted value of an individual observation. By using the family as a feature, it can estimate a per observation family SHAP value and then I can obtain the median value as a "genetic" value per family. I hypothesize that it might be more accurate than the BLUPs because it can reduce the environmental and location factor more accurately, but in contrast, it requires a looooot moooore computational time to estimate these values.
+
+```{r}
+# Using catboost
+
+seeds <- c(100, 30, 1518515, 181531125, 161921)
+
+highland_22_catboost_dataset <- 
+  highland_22_pheno_data %>%
+  select(location, family, pop, nblock, PC1, phc:sg) %>%
+  filter(family != "HERMES") %>%
+  mutate(
+    location = as_factor(location),
+    family = factor(family, levels = family_levels),
+    pop = as_factor(pop),
+    nblock = as_factor(nblock)
+    ) %>%
+  pivot_longer(phc:sg, names_to = "phenotype") %>%
+  filter(!is.na(value)) %>%
+  group_by(phenotype) %>%
+  nest() %>%
+  mutate(seed = list(seeds)) %>%
+  unnest(seed) %>%
+  mutate(split = map2(
+    .x = seeds,
+    .y = data,
+    .f = ~ {
+      set.seed(.x)
+      initial_split(.y, strata = value)
+    }
+  )) %>%
+  mutate(pool_training = map(
+    .x = split,
+    .f = ~ catboost.load_pool(
+      data = training(.x) %>% select(-value),
+      label = training(.x) %>% select(value)
+    )
+  )) %>%
+  mutate(pool_testing = map(
+    .x = split,
+    .f = ~ catboost.load_pool(
+      data = testing(.x) %>% select(-value),
+      label = testing(.x) %>% select(value)
+    )
+  )) %>%
+  mutate(pool_whole = map(
+    .x = split,
+    .f = ~ catboost.load_pool(
+      data = .x$data %>% select(-value),
+      label = .x$data %>% select(value)
+    )))
+
+
+catboost_set <- parameters(
+  list(
+    learn_rate(range = c(0.01,0.5), trans = NULL),
+    trees(range = c(10, 500), trans = NULL),#trees(): The number of trees contained in a random forest or boosted ensemble. In the latter case, this is equal to the number of boosting iterations
+    loss_reduction(range = c(0,3), trans = NULL), #This corresponds to gamma in xgboost
+    tree_depth(range = c(6,10), trans = NULL),
+    sample_prop(range = c(0.2,1), trans = NULL) # assume is same with min_child_weight parameter in boosting trees
+  ))
+
+set.seed(100)
+ls_grid <- grid_latin_hypercube(catboost_set, size = 20) %>%
+  rename_with( ~c("learning_rate", "iterations", "l2_leaf_reg", "depth", "rsm")
+  ) %>%
+  mutate(border_count = 254) %>%
+  as.data.frame()
+
+fit_control <- trainControl(method = "cv", number = 4, classProbs = F)
+
+# catboost_tuning <- 
+#   highland_22_catboost_dataset %>%
+#   select(phenotype, seed, split) %>%
+#   mutate(training_set = map(
+#     .x = split,
+#     .f = ~ training(.x)
+#   )) %>%
+#   select(-split) %>%
+#   mutate(tunning_report = map2(
+#     .x = seed,
+#     .y = training_set,
+#     .f = ~
+#       {
+#         set.seed(.x)
+#         caret::train(
+#           .y %>% select(-value),
+#           .y %>% select(value) %>% unlist(),
+#           method = catboost.caret, 
+#           preProc = NULL, 
+#           tuneGrid = ls_grid, 
+#           trControl = fit_control,
+#           metric="RMSE"
+#         )
+#       }
+#   ))
+# 
+# saveRDS(catboost_tuning, "catboost_tuning.rds")
+
+catboost_tuning <- readRDS("C:/Users/sergi/Documents/SAWERS LAB/CML_highland_experiment/catboost_tuning.rds")
+
+catboost_tunning_results <- 
+  catboost_tuning %>%
+  mutate(results = map(
+    .x = tunning_report,
+    .f = ~ .x$results %>% as_tibble()
+  )) %>%
+  select(phenotype, seed, results) %>%
+  unnest(results) %>%
+  group_by(phenotype) %>%
+  filter(Rsquared == max(Rsquared))
+
+catboost_params <-
+  catboost_tunning_results %>%
+  select(phenotype, depth:iterations) %>%
+    pivot_longer(-phenotype) %>%
+    group_by(phenotype) %>%
+    summarise(
+      across(c(name, value), ~ list(.))
+    ) %>%
+    mutate(params = map2(
+      .x = name, 
+      .y = value,
+      .f = ~ .y %>% 
+        as.list() %>% 
+        setNames(.x) %>% 
+        c(., list(loss_function = 'RMSE',task_type = 'CPU')) %>%
+        list() %>%
+        flatten()
+    )) %>%
+  select(phenotype, params)
+
+catbbost_model_df <- 
+  highland_22_catboost_dataset %>%
+  select(phenotype, seed, data, contains("pool")) %>%
+  left_join(catboost_params) %>%
+  ungroup() %>%
+  mutate(
+    model = pmap(
+      .l =.,
+      .f = ~ with(
+        list(...),
+        {
+          set.seed(seed)
+          catboost.train(pool_training, pool_testing, params = params)
+        }
+      )
+  )) %>%
+  mutate(
+    whole_pred = pmap(
+      .l = .,
+      .f = ~ with(
+        list(...),
+        {
+          set.seed(seed)
+          catboost.predict(model, pool_whole, prediction_type='RawFormulaVal')
+        }
+      ))) %>%
+  mutate(whole_r2 = map2_dbl(
+    .x = data,
+    .y = whole_pred,
+    .f = ~ cor(.x$value, .y)^2
+  )) %>%
+  mutate(SHAP = pmap(
+    .l =.,
+    .f = ~ with(
+      list(...),
+      catboost.get_feature_importance(
+        model, 
+        pool_whole, 
+        type = 'ShapValues', 
+        thread_count = -1
+      ) %>%
+        as_tibble() %>%
+        rename_with(~names(data)) %>%
+        rename(intercept = value) %>%
+        rename_with(~paste0(., "_SHAP"))
+      ))) %>%
+  mutate(importance = pmap(
+    .l =.,
+    .f = ~ with(
+      list(...),
+      catboost.get_feature_importance(
+        model, 
+        pool_whole, 
+        type = 'FeatureImportance', 
+        thread_count = -1
+      ) %>%
+        as_tibble(., rownames = "feature") %>%
+        rename("importance" = V1)
+      )))
+    
+catboost_importance_plot <- 
+  catbbost_model_df %>%
+  select(phenotype, seed, importance) %>%
+  unnest(importance) %>%
+  mutate(seed = as_factor(seed)) %>%
+  ggplot(data =., aes(x = importance, y = feature)) +
+  geom_boxplot() +
+  facet_grid(phenotype ~ .) +
+  geom_point(aes(color = seed))
+
+catboost_importance_plot
+
+
+catboost_SHAP_df <- 
+  catbbost_model_df %>%
+  select(phenotype, seed, data, SHAP, seed) %>%
+  unnest(c(data, SHAP)) %>%
+  select(phenotype, seed, pop, location, family, value, contains("SHAP"))
+
+catboost_family_SHAP_all <- 
+  catboost_SHAP_df %>%
+  select(phenotype, seed, location, family, pop, family_SHAP, value) %>%
+  group_by(phenotype, location, pop, family, value) %>%
+  summarise(family_SHAP = mean(family_SHAP)) %>%
+  ungroup() 
+
+family_SHAP <- 
+  catboost_family_SHAP_all %>%
+  group_by(phenotype, family) %>%
+  summarise(family_SHAP = median(family_SHAP)) %>%
+  mutate(phenotype = paste0(phenotype, "_SHAP")) %>%
+  pivot_wider(names_from = phenotype, values_from = family_SHAP)
+
+
+family_SHAP %>%
+  mutate(pop = gsub("-\\d{3}$", "", family)) %>%
+  pivot_longer(contains("SHAP")) %>%
+  ggplot(data =., aes(x = value, fill = pop, )) +
+  geom_density(color = "black", alpha = 0.5) +
+  geom_vline(
+    data = . %>% group_by(name, pop) %>% summarise(value = median(value)),
+    aes(xintercept = value, color = pop),
+    linetype = "dashed",
+    linewidth = 0.75
+  ) +
+  facet_wrap(. ~ name, scales = "free") +
+  xlab("median SHAP value") +
+  ggtitle("Distribution of the estimated median family SHAP value per population") +
+  theme(
+      plot.title = element_text(hjust = 0.5),
+      panel.background = element_rect(fill = "white", colour ="grey50"),
+      text = element_text(size = 12)
+    ) 
+
+
+family_SHAP %>%
+  pivot_longer(contains("SHAP"), names_to = "pheno", values_to = "SHAP") %>%
+  mutate(pheno = gsub("_SHAP$", "", pheno)) %>%
+  left_join(
+    higland_22_BLUP %>%
+      pivot_longer(contains("BLUP"), names_to = "pheno", values_to = "BLUP") %>%
+      mutate(pheno = gsub("_BLUP$", "", pheno))
+  ) %>%
+  group_by(pheno) %>%
+  nest() %>%
+  mutate(r = map_dbl(.x = data, .f = ~ cor(.x$SHAP, .x$BLUP)))
+
+shap_blup_family <- higland_22_BLUP %>%
+  left_join(family_SHAP)
+
+write_sheet(
+  data = shap_blup_family,
+  ss = as_id(CML_experiment_meta_url),
+  "BLUP_SHAP_family_estimates"
+  )
+
+
+
+
+```
+
